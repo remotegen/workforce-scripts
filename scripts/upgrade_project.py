@@ -30,6 +30,7 @@ import traceback
 import sys
 import arcgis
 import copy
+import json
 from arcgis.apps import workforce
 from arcgis.gis import GIS
 
@@ -90,66 +91,95 @@ def main(arguments):
     workers = {w.global_id: {"source": w.feature, "target": copy.deepcopy(w.feature)} for w in project.workers.search()}
     dispatchers = {d.global_id: {"source": d.feature, "target": copy.deepcopy(d.feature)} for d in project.dispatchers.search()}
 
-    results = upgraded_project.workers_layer.edit_features(
-        adds=[w["target"] for w in workers.values()],
-        use_global_ids=True
-    )
-    for res in results["addResults"]:
-        if res["success"]:
-            workers[res["globalId"]]["target"].attributes[upgraded_project._worker_schema.object_id] = res["objectId"]
-        else:
-            raise Exception("Failed to add workers")
+    ws = [w["target"] for w in workers.values()]
+    if ws:
+        results = upgraded_project.workers_layer.edit_features(
+            adds=ws,
+            use_global_ids=True
+        )
+        for res in results["addResults"]:
+            if res["success"]:
+                workers[res["globalId"]]["target"].attributes[project._worker_schema.object_id] = res["objectId"]
+            else:
+                raise Exception("Failed to add workers")
 
     logger.info("Copying Dispatchers...")
-    results = upgraded_project.dispatchers_layer.edit_features(
-        adds=[d["target"] for d in dispatchers.values() if d["target"].attributes[upgraded_project._dispatcher_schema.user_id] != gis.users.me.username],
-        use_global_ids=True
-    )
-    for res in results["addResults"]:
-        if res["success"]:
-            dispatchers[res["globalId"]]["target"].attributes[upgraded_project._dispatcher_schema.object_id] = res["objectId"]
-        else:
-            raise Exception("Failed to add dispatchers")
-    usernames = [w["source"].attributes[upgraded_project._worker_schema.user_id] for w in workers.values()]
-    usernames.extend([w["source"].attributes[upgraded_project._dispatcher_schema.user_id] for w in dispatchers.values()])
-    upgraded_project.group.add_users(set(usernames))
+    dispatchers_to_add = [d["target"] for d in dispatchers.values() if d["target"].attributes[project._dispatcher_schema.user_id] != gis.users.me.username]
+    if dispatchers_to_add:
+        results = upgraded_project.dispatchers_layer.edit_features(
+            adds=dispatchers_to_add,
+            use_global_ids=True
+        )
+        for res in results["addResults"]:
+            if res["success"]:
+                dispatchers[res["globalId"]]["target"].attributes[project._dispatcher_schema.object_id] = res["objectId"]
+            else:
+                raise Exception("Failed to add dispatchers")
+        usernames = [w["source"].attributes[project._worker_schema.user_id] for w in workers.values()]
+        usernames.extend([w["source"].attributes[project._dispatcher_schema.user_id] for w in dispatchers.values()])
+        upgraded_project.group.add_users(set(usernames))
 
     # copy over assignments
     logger.info("Copying Assignments...")
     assignments = {a.global_id: {"source": a.feature, "target": copy.deepcopy(a.feature)} for a in project.assignments.search()}
-    worker_mapping = {w["source"].attributes[upgraded_project._worker_schema.object_id]: w["target"].attributes[upgraded_project._worker_schema.object_id] for w in workers.values()}
-    dispatcher_mapping = {w["source"].attributes[upgraded_project._dispatcher_schema.object_id]: w["target"].attributes[upgraded_project._dispatcher_schema.object_id] for w in dispatchers.values()}
+    worker_mapping = {w["source"].attributes[project._worker_schema.object_id]: w["target"].attributes[project._worker_schema.object_id] for w in workers.values()}
+    dispatcher_mapping = {w["source"].attributes[project._dispatcher_schema.object_id]: w["target"].attributes[project._dispatcher_schema.object_id] for w in dispatchers.values()}
     # swizzle worker and dispatcher ids
     for a in assignments.values():
-        a["target"].attributes[upgraded_project._assignment_schema.worker_id] = worker_mapping.get(a["source"].attributes[upgraded_project._assignment_schema.worker_id], None)
-        a["target"].attributes[upgraded_project._assignment_schema.dispatcher_id] = dispatcher_mapping.get(a["source"].attributes[upgraded_project._assignment_schema.dispatcher_id])
-        a["target"].attributes.pop(upgraded_project._assignment_schema.assignment_read, None)
-    results = upgraded_project.assignments_layer.edit_features(
-        adds=[a["target"] for a in assignments.values()],
-        use_global_ids=True
-    )
-    for res in results["addResults"]:
-        if res["success"]:
-            assignments[res["globalId"]]["target"].attributes[upgraded_project._assignment_schema.object_id] = res["objectId"]
-        else:
-            raise Exception("Failed to add assignments")
-    assignment_mapping = {a["source"].attributes[upgraded_project._assignment_schema.object_id]: a["target"].attributes[upgraded_project._assignment_schema.object_id] for a in assignments.values()}
+        a["target"].attributes[project._assignment_schema.worker_id] = worker_mapping.get(a["source"].attributes[project._assignment_schema.worker_id], None)
+        a["target"].attributes[project._assignment_schema.dispatcher_id] = dispatcher_mapping.get(a["source"].attributes[project._assignment_schema.dispatcher_id])
+        a["target"].attributes.pop(project._assignment_schema.assignment_read, None)
+    assignments_to_add = [a["target"] for a in assignments.values()]
+    if assignments_to_add:
+        results = upgraded_project.assignments_layer.edit_features(
+            adds=assignments_to_add,
+            use_global_ids=True
+        )
+        for res in results["addResults"]:
+            if res["success"]:
+                assignments[res["globalId"]]["target"].attributes[project._assignment_schema.object_id] = res["objectId"]
+            else:
+                raise Exception("Failed to add assignments")
+        assignment_mapping = {a["source"].attributes[project._assignment_schema.object_id]: a["target"].attributes[project._assignment_schema.object_id] for a in assignments.values()}
 
-    logger.info("Copying Attachments...")
-    attachments = project.assignments_layer.attachments.search()
-    for a in attachments:
-        with tempfile.TemporaryDirectory() as dirpath:
-            paths = project.assignments_layer.attachments.download(a['PARENTOBJECTID'], a['ID'], dirpath)
-            upgraded_project.assignments_layer.attachments.add(
-                assignment_mapping[a['PARENTOBJECTID']],
-                paths[0]
-            )
+        logger.info("Copying Attachments...")
+        attachments = project.assignments_layer.attachments.search()
+        for a in attachments:
+            with tempfile.TemporaryDirectory() as dirpath:
+                paths = project.assignments_layer.attachments.download(a['PARENTOBJECTID'], a['ID'], dirpath)
+                upgraded_project.assignments_layer.attachments.add(
+                    assignment_mapping[a['PARENTOBJECTID']],
+                    paths[0]
+                )
 
-    # TODO
-    # copy webmap layers
-    # need to skip existing WF layers
-
+    logger.info("Copying Webmaps...")
+    upgrade_webmaps(project.worker_webmap, upgraded_project.worker_webmap)
+    upgrade_webmaps(project.dispatcher_webmap, upgraded_project.dispatcher_webmap)
     logger.info("Completed")
+
+
+def upgrade_webmaps(old_webmap, new_webmap):
+    new_data = new_webmap.item.get_data()
+    old_data = old_webmap.item.get_data()
+    for i, layer in enumerate(old_data["operationalLayers"]):
+        if "Workers_0" == layer["id"]:
+            old_data["operationalLayers"][i] = get_wf_operational_layer(new_data, "Workers_0")
+        elif "Assignments_0" == layer["id"]:
+            old_data["operationalLayers"][i] = get_wf_operational_layer(new_data, "Assignments_0")
+    # remove location tracking layer
+    for i, layer in enumerate(old_data["operationalLayers"]):
+        if "Location Tracking_0" == layer["id"]:
+            old_data["operationalLayers"].pop(i)
+    new_webmap.item.update(item_properties={
+        "text": json.dumps(old_data),
+        "extent": old_webmap.item.extent
+    })
+
+
+def get_wf_operational_layer(data, layer_id):
+    for layer in data["operationalLayers"]:
+        if layer["id"] == layer_id:
+            return layer
 
 
 if __name__ == "__main__":
